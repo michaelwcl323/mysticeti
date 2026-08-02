@@ -30,8 +30,10 @@ pub struct Testbed<C> {
 impl<C: ServerProviderClient> Testbed<C> {
     /// Create a new testbed instance with the specified settings and client.
     pub async fn new(settings: Settings, client: C) -> TestbedResult<Self> {
-        let public_key = settings.load_ssh_public_key()?;
-        client.register_ssh_public_key(public_key).await?;
+        if client.requires_ssh_key_registration() {
+            let public_key = settings.load_ssh_public_key()?;
+            client.register_ssh_public_key(public_key).await?;
+        }
         let instances = client.list_instances().await?;
 
         Ok(Self {
@@ -42,8 +44,8 @@ impl<C: ServerProviderClient> Testbed<C> {
     }
 
     /// Return the username to connect to the instances through ssh.
-    pub fn username(&self) -> &'static str {
-        C::USERNAME
+    pub fn username(&self) -> &str {
+        self.client.username()
     }
 
     /// Return the list of instances of the testbed.
@@ -97,9 +99,13 @@ impl<C: ServerProviderClient> Testbed<C> {
                     table.add_row(row![]);
                 }
                 let private_key_file = self.settings.ssh_private_key_file.display();
-                let username = C::USERNAME;
-                let ip = instance.main_ip;
-                let connect = format!("ssh -i {private_key_file} {username}@{ip}");
+                let username = self.client.username();
+                let address = instance.ssh_address();
+                let connect = format!(
+                    "ssh -i {private_key_file} -p {} {username}@{}",
+                    address.port(),
+                    address.ip()
+                );
                 if !instance.is_terminated() {
                     if instance.is_active() {
                         table.add_row(row![bFg->format!("{j}"), connect]);
@@ -126,6 +132,30 @@ impl<C: ServerProviderClient> Testbed<C> {
     /// Populate the testbed by creating the specified amount of instances per region. The total
     /// number of instances created is thus the specified amount x the number of regions.
     pub async fn deploy(&mut self, quantity: usize, region: Option<String>) -> TestbedResult<()> {
+        if !self.client.manages_instance_lifecycle() {
+            display::action("Validating pre-allocated CloudLab instances");
+            self.instances = self.client.list_instances().await?;
+            let regions = region
+                .map(|value| vec![value])
+                .unwrap_or_else(|| self.settings.regions.clone());
+            let configured = self
+                .instances
+                .iter()
+                .filter(|instance| {
+                    regions.contains(&instance.region) && self.settings.filter_instances(instance)
+                })
+                .collect::<Vec<_>>();
+            let unavailable = configured
+                .iter()
+                .filter(|instance| instance.is_inactive())
+                .count();
+            if unavailable != 0 {
+                return Err(TestbedError::InsufficientCapacity(unavailable));
+            }
+            self.wait_until_reachable(configured.into_iter()).await?;
+            display::done();
+            return Ok(());
+        }
         display::action(format!("Deploying instances ({quantity} per region)"));
 
         let instances = match region {
@@ -152,6 +182,12 @@ impl<C: ServerProviderClient> Testbed<C> {
 
     /// Destroy all instances of the testbed.
     pub async fn destroy(&mut self) -> TestbedResult<()> {
+        if !self.client.manages_instance_lifecycle() {
+            return Err(crate::error::CloudProviderError::UnsupportedOperation(
+                "CloudLab hosts are pre-allocated; destroy them through the CloudLab UI".into(),
+            )
+            .into());
+        }
         display::action("Destroying testbed");
 
         try_join_all(
@@ -168,6 +204,25 @@ impl<C: ServerProviderClient> Testbed<C> {
     /// Start the specified number of instances in each region. Returns an error if there are not
     /// enough available instances.
     pub async fn start(&mut self, quantity: usize) -> TestbedResult<()> {
+        if !self.client.manages_instance_lifecycle() {
+            display::action("Validating pre-allocated CloudLab instances");
+            self.instances = self.client.list_instances().await?;
+            let configured = self
+                .instances
+                .iter()
+                .filter(|instance| self.settings.filter_instances(instance))
+                .collect::<Vec<_>>();
+            let unavailable = configured
+                .iter()
+                .filter(|instance| instance.is_inactive())
+                .count();
+            if unavailable != 0 {
+                return Err(TestbedError::InsufficientCapacity(unavailable));
+            }
+            self.wait_until_reachable(configured.into_iter()).await?;
+            display::done();
+            return Ok(());
+        }
         display::action("Booting instances");
 
         // Gather available instances.
@@ -200,6 +255,12 @@ impl<C: ServerProviderClient> Testbed<C> {
 
     /// Stop all instances of the testbed.
     pub async fn stop(&mut self) -> TestbedResult<()> {
+        if !self.client.manages_instance_lifecycle() {
+            return Err(crate::error::CloudProviderError::UnsupportedOperation(
+                "CloudLab hosts are pre-allocated; stop them through the CloudLab UI".into(),
+            )
+            .into());
+        }
         display::action("Stopping instances");
 
         // Stop all instances.
@@ -242,10 +303,18 @@ impl<C: ServerProviderClient> Testbed<C> {
                 .filter(|x| instances_ids.contains(&x.id))
                 .map(|instance| {
                     let private_key_file = self.settings.ssh_private_key_file.clone();
-                    SshConnection::new(instance.ssh_address(), C::USERNAME, private_key_file)
+                    let passphrase = self.settings.ssh_private_key_passphrase();
+                    SshConnection::new(
+                        instance.ssh_address(),
+                        self.client.username(),
+                        private_key_file,
+                        passphrase,
+                    )
                 });
-            if try_join_all(futures).await.is_ok() {
-                break;
+            match try_join_all(futures).await {
+                Ok(_) => break,
+                Err(error) if !self.client.manages_instance_lifecycle() => return Err(error.into()),
+                Err(_) => continue,
             }
         }
         Ok(())

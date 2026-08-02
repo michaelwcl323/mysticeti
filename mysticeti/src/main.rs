@@ -40,6 +40,10 @@ enum Operation {
         /// The working directory where the files will be generated.
         #[clap(long, value_name = "FILE", default_value = "genesis")]
         working_directory: PathBuf,
+        /// First port used by validator networking. Metrics ports immediately
+        /// follow the validator port range.
+        #[clap(long, value_name = "PORT", default_value = "1500")]
+        base_port: u16,
     },
     /// Run a validator node.
     Run {
@@ -87,7 +91,8 @@ async fn main() -> Result<()> {
         Operation::BenchmarkGenesis {
             ips,
             working_directory,
-        } => benchmark_genesis(ips, working_directory)?,
+            base_port,
+        } => benchmark_genesis(ips, working_directory, base_port)?,
         Operation::Run {
             authority,
             committee_path,
@@ -113,7 +118,12 @@ async fn main() -> Result<()> {
 }
 
 /// Generate all the genesis files required for benchmarks.
-fn benchmark_genesis(ips: Vec<IpAddr>, working_directory: PathBuf) -> Result<()> {
+fn benchmark_genesis(ips: Vec<IpAddr>, working_directory: PathBuf, base_port: u16) -> Result<()> {
+    eyre::ensure!(
+        usize::from(base_port) + 2 * ips.len() - 1 <= usize::from(u16::MAX),
+        "base port {base_port} is too high for {} validators",
+        ips.len()
+    );
     tracing::info!("Generating benchmark genesis files");
     fs::create_dir_all(&working_directory).wrap_err(format!(
         "Failed to create directory '{}'",
@@ -131,6 +141,7 @@ fn benchmark_genesis(ips: Vec<IpAddr>, working_directory: PathBuf) -> Result<()>
     let mut parameters_path = working_directory.clone();
     parameters_path.push(Parameters::DEFAULT_FILENAME);
     Parameters::new_for_benchmarks(ips)
+        .with_base_port(base_port)
         .print(&parameters_path)
         .wrap_err("Failed to print parameters file")?;
     tracing::info!(

@@ -62,6 +62,7 @@ impl BenchmarkType for MysticetiBenchmarkType {}
 /// All configurations information to run a Mysticeti client or validator.
 pub struct MysticetiProtocol {
     working_dir: PathBuf,
+    benchmark_base_port: u16,
 }
 
 impl ProtocolCommands<MysticetiBenchmarkType> for MysticetiProtocol {
@@ -82,10 +83,9 @@ impl ProtocolCommands<MysticetiBenchmarkType> for MysticetiProtocol {
     where
         I: Iterator<Item = &'a Instance>,
     {
-        let ips = instances
-            .map(|x| x.main_ip.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let ips = instances.map(|x| x.main_ip.to_string()).collect::<Vec<_>>();
+        let committee_size = ips.len();
+        let ips = ips.join(" ");
         let working_directory = self.working_dir.display();
 
         let genesis = [
@@ -95,7 +95,25 @@ impl ProtocolCommands<MysticetiBenchmarkType> for MysticetiProtocol {
         ]
         .join(" ");
 
-        ["source $HOME/.cargo/env", &genesis].join(" && ")
+        let mut commands = vec!["source $HOME/.cargo/env".to_string(), genesis];
+        if self.benchmark_base_port != Parameters::BENCHMARK_PORT_OFFSET {
+            let parameters_file = self.working_dir.join(Parameters::DEFAULT_FILENAME);
+            for offset in 0..2 * committee_size {
+                let old_port = usize::from(Parameters::BENCHMARK_PORT_OFFSET) + offset;
+                commands.push(format!(
+                    "sed -i 's/:{old_port}/:__MYSTICETI_PORT_{offset}__/g' {}",
+                    parameters_file.display()
+                ));
+            }
+            for offset in 0..2 * committee_size {
+                let new_port = usize::from(self.benchmark_base_port) + offset;
+                commands.push(format!(
+                    "sed -i 's/:__MYSTICETI_PORT_{offset}__/:{new_port}/g' {}",
+                    parameters_file.display()
+                ));
+            }
+        }
+        commands.join(" && ")
     }
 
     fn monitor_command<I>(&self, instances: I) -> Vec<(Instance, String)>
@@ -185,6 +203,7 @@ impl MysticetiProtocol {
     pub fn new(settings: &Settings) -> Self {
         Self {
             working_dir: settings.working_dir.clone(),
+            benchmark_base_port: settings.benchmark_base_port,
         }
     }
 }
@@ -204,7 +223,8 @@ impl ProtocolMetrics for MysticetiProtocol {
             .into_iter()
             .map(|x| (IpAddr::V4(x.main_ip), x))
             .unzip();
-        let parameters = config::Parameters::new_for_benchmarks(ips);
+        let parameters =
+            config::Parameters::new_for_benchmarks(ips).with_base_port(self.benchmark_base_port);
         let metrics_paths = parameters
             .all_metric_addresses()
             .map(|x| format!("{x}{}", mysticeti_core::prometheus::METRICS_ROUTE));
@@ -218,5 +238,32 @@ impl ProtocolMetrics for MysticetiProtocol {
     {
         // TODO: hack until we have benchmark clients.
         self.nodes_metrics_path(instances)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        client::Instance,
+        protocol::{mysticeti::MysticetiProtocol, ProtocolCommands},
+        settings::Settings,
+    };
+
+    #[test]
+    fn cloudlab_genesis_rewrites_ports_for_legacy_remote_binary() {
+        let mut settings = Settings::new_for_test();
+        settings.benchmark_base_port = 5000;
+        settings.working_dir = "~/working_dir".into();
+        let protocol = MysticetiProtocol::new(&settings);
+        let instances = (0..4)
+            .map(|index| Instance::new_for_test(index.to_string()))
+            .collect::<Vec<_>>();
+
+        let command = protocol.genesis_command(instances.iter());
+        assert!(command.contains("benchmark-genesis"));
+        assert!(!command.contains("--base-port"));
+        assert!(command.contains("__MYSTICETI_PORT_0__"));
+        assert!(command.contains(":5000"));
+        assert!(command.contains(":5007"));
     }
 }

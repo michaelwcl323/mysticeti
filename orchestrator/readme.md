@@ -4,6 +4,74 @@ The Orchestrator crate provides facilities for quickly deploying and benchmarkin
 
 This guide provides a step-by-step explanation of how to run geo-distributed benchmarks on either [Vultr](http://vultr.com) or [Amazon Web Services (AWS)](http://aws.amazon.com).
 
+## Running on pre-allocated CloudLab nodes
+
+CloudLab uses the same install, update, genesis, validator, metrics, and result
+pipeline as AWS. The difference is that the orchestrator reads a static host
+inventory and never allocates, powers off, or destroys CloudLab machines.
+
+Copy the example inventory and edit its key, repository, username, and hosts:
+
+```bash
+cp orchestrator/assets/cloudlab-settings.example.json cloudlab-orchestrator.json
+```
+
+The legacy `cloudlab_settings.json` format containing `key`, `repo`, `port`,
+and `hosts` is also accepted directly. All CloudLab hosts must currently use
+the same SSH username. If the SSH key is encrypted, do not put its passphrase
+in the JSON file; export it for the orchestrator process:
+
+```bash
+export SSH_KEY_PASSWORD='your-key-passphrase'
+```
+
+Check TCP reachability and display the static inventory:
+
+```bash
+cargo run --release --bin orchestrator -- \
+  --settings-path cloudlab-orchestrator.json \
+  testbed status
+```
+
+Validate SSH authentication to every configured host. For CloudLab,
+`deploy` is validation-only and does not create machines:
+
+```bash
+cargo run --release --bin orchestrator -- \
+  --settings-path cloudlab-orchestrator.json \
+  testbed deploy --instances 1
+```
+
+Run ten validators on ten existing hosts. Monitoring must be disabled unless
+an additional host is present because the monitoring stack uses a dedicated
+machine:
+
+```bash
+cargo run --release --bin orchestrator -- \
+  --settings-path cloudlab-orchestrator.json \
+  benchmark \
+  --committee 10 \
+  --benchmark-type 500 \
+  --duration 60 \
+  --scrape-interval 5 \
+  --monitoring=false \
+  fixed-load --loads 20000,40000,60000,80000
+```
+
+By default the first benchmark installs dependencies, fetches the configured
+repository commit, and builds `mysticeti` on every host. Use
+`--skip-testbed-update` only after all hosts contain the correct build. Results
+are saved directly below `results/mysticeti/` by default.
+Each run writes one timestamped human-readable `summary-*.txt` containing the sanitized testbed
+inventory, repository and port settings, orchestrator execution options,
+benchmark parameters, and the final owned/shared TPS and latency summary. Raw
+Prometheus samples are not written to disk. Repeated runs receive a unique
+start-time identifier and do not overwrite one another. Downloaded logs are
+stored separately below `logs/mysticeti/` when
+`--log-processing` is enabled. `testbed stop` and
+`testbed destroy` deliberately return an error for CloudLab; use the CloudLab
+UI for physical node lifecycle operations.
+
 ## Step 1. Set up cloud provider credentials
 
 To enable programmatic access to your cloud provider account from your local machine, you need to set up your cloud provider credentials. These credentials authorize your machine to create, delete, and edit instances programmatically on your account.

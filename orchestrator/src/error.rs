@@ -46,6 +46,9 @@ pub enum CloudProviderError {
 
     #[error("SSH key \"{0}\" not found")]
     SshKeyNotFound(String),
+
+    #[error("Operation is not supported by this cloud provider: {0}")]
+    UnsupportedOperation(String),
 }
 
 pub type SshResult<T> = Result<T, SshError>;

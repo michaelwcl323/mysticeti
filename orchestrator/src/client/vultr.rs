@@ -52,6 +52,8 @@ impl From<VultrInstance> for Instance {
             id: instance.id,
             region: instance.region,
             main_ip: instance.main_ip,
+            ssh_ip: None,
+            ssh_port: 22,
             tags: instance.tags,
             specs: instance.plan,
             status: instance.power_status,
@@ -83,7 +85,7 @@ impl Display for VultrClient {
 }
 
 impl VultrClient {
-    const BASE_URL: &str = "https://api.vultr.com/v2/";
+    const BASE_URL: &'static str = "https://api.vultr.com/v2/";
     const DEFAULT_OS: u16 = 1743; // Ubuntu 22.04 x64
 
     /// Make a new Vultr client.
@@ -156,7 +158,9 @@ impl VultrClient {
 
 #[async_trait::async_trait]
 impl ServerProviderClient for VultrClient {
-    const USERNAME: &'static str = "root";
+    fn username(&self) -> &str {
+        "root"
+    }
 
     async fn list_instances(&self) -> CloudProviderResult<Vec<Instance>> {
         let url = self.base_url.join("instances").unwrap();

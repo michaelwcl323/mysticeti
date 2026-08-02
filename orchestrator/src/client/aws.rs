@@ -105,6 +105,8 @@ impl AwsClient {
                 .unwrap_or("0.0.0.0") // Stopped instances do not have an ip address.
                 .parse()
                 .expect("AWS instance should have a valid ip"),
+            ssh_ip: None,
+            ssh_port: 22,
             tags: vec![self.settings.testbed_id.clone()],
             specs: format!(
                 "{:?}",
@@ -226,7 +228,9 @@ impl AwsClient {
 
 #[async_trait::async_trait]
 impl ServerProviderClient for AwsClient {
-    const USERNAME: &'static str = "ubuntu";
+    fn username(&self) -> &str {
+        "ubuntu"
+    }
 
     async fn list_instances(&self) -> CloudProviderResult<Vec<Instance>> {
         let filter = filter::Builder::default()

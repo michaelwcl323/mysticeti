@@ -3,10 +3,11 @@
 
 use std::{
     collections::HashMap,
+    fmt::Write as FmtWrite,
     fs,
     io::BufRead,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use prettytable::{row, Table};
@@ -159,12 +160,105 @@ impl Measurement {
 /// The identifier of the scrapers collecting the prometheus metrics.
 type ScraperId = usize;
 
+/// A sanitized snapshot of the testbed settings used for an experiment.
+/// Secret values are deliberately not persisted with benchmark results.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct TestbedParameters {
+    pub testbed_id: String,
+    pub cloud_provider: String,
+    pub token_file: PathBuf,
+    pub ssh_private_key_file: PathBuf,
+    pub ssh_private_key_passphrase_configured: bool,
+    pub ssh_public_key_file: Option<PathBuf>,
+    pub regions: Vec<String>,
+    pub machine_specs: String,
+    pub repository_url: String,
+    pub repository_commit: String,
+    pub benchmark_base_port: u16,
+    pub working_directory: PathBuf,
+    pub results_directory: PathBuf,
+    pub logs_directory: PathBuf,
+    pub cloudlab_hosts: Vec<CloudLabHostParameters>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct CloudLabHostParameters {
+    pub hostname: String,
+    pub protocol_ip: Option<String>,
+    pub username: String,
+    pub port: u16,
+    pub region: String,
+}
+
+impl TestbedParameters {
+    fn from_settings(settings: &Settings) -> Self {
+        let mut repository_url = settings.repository.url.clone();
+        repository_url.set_username("").ok();
+        repository_url.set_password(None).ok();
+        repository_url.set_query(None);
+        repository_url.set_fragment(None);
+
+        Self {
+            testbed_id: settings.testbed_id.clone(),
+            cloud_provider: format!("{:?}", settings.cloud_provider).to_lowercase(),
+            token_file: settings.token_file.clone(),
+            ssh_private_key_file: settings.ssh_private_key_file.clone(),
+            ssh_private_key_passphrase_configured: settings.ssh_private_key_passphrase().is_some(),
+            ssh_public_key_file: settings.ssh_public_key_file.clone(),
+            regions: settings.regions.clone(),
+            machine_specs: settings.specs.clone(),
+            repository_url: repository_url.into(),
+            repository_commit: settings.repository.commit.clone(),
+            benchmark_base_port: settings.benchmark_base_port,
+            working_directory: settings.working_dir.clone(),
+            results_directory: settings.results_dir.clone(),
+            logs_directory: settings.logs_dir.clone(),
+            cloudlab_hosts: settings
+                .cloudlab_hosts
+                .iter()
+                .map(|host| CloudLabHostParameters {
+                    hostname: host.hostname.to_string(),
+                    protocol_ip: host.protocol_ip.map(|ip| ip.to_string()),
+                    username: host.username.clone(),
+                    port: host.port,
+                    region: host.region.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Parameters controlling how the orchestrator executes and observes a run.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ExecutionParameters {
+    pub command_line: Vec<String>,
+    pub scrape_interval: Duration,
+    pub crash_interval: Duration,
+    pub skip_testbed_update: bool,
+    pub skip_testbed_configuration: bool,
+    pub log_processing: bool,
+    pub dedicated_clients: usize,
+    pub monitoring: bool,
+    pub ssh_timeout: Option<Duration>,
+    pub ssh_retries: usize,
+    pub protocol_environment: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MeasurementsCollection<T> {
+    /// Stable identifier for this run. Repeated runs therefore never overwrite each other.
+    #[serde(default)]
+    pub run_started_at_unix_ms: u64,
     /// The machine / instance type.
     pub machine_specs: String,
     /// The commit of the codebase.
     pub commit: String,
+    /// Sanitized testbed and deployment settings used for this run.
+    #[serde(default)]
+    pub testbed_parameters: TestbedParameters,
+    /// Orchestrator execution settings used for this run.
+    #[serde(default)]
+    pub execution_parameters: ExecutionParameters,
     /// The benchmark parameters of the current run.
     pub parameters: BenchmarkParameters<T>,
     /// The data collected by each scraper.
@@ -175,11 +269,28 @@ impl<T: BenchmarkType> MeasurementsCollection<T> {
     /// Create a new (empty) collection of measurements.
     pub fn new(settings: &Settings, parameters: BenchmarkParameters<T>) -> Self {
         Self {
+            run_started_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             machine_specs: settings.specs.clone(),
             commit: settings.repository.commit.clone(),
+            testbed_parameters: TestbedParameters::from_settings(settings),
+            execution_parameters: ExecutionParameters::default(),
             parameters,
             data: HashMap::new(),
         }
+    }
+
+    /// Add the parameters controlling orchestration of this run.
+    pub fn with_execution_parameters(mut self, parameters: ExecutionParameters) -> Self {
+        self.execution_parameters = parameters;
+        self
+    }
+
+    /// Attach current sanitized testbed settings when converting a legacy result.
+    pub fn record_testbed_parameters(&mut self, settings: &Settings) {
+        self.testbed_parameters = TestbedParameters::from_settings(settings);
     }
 
     /// Load a collection of measurement from a json file.
@@ -271,12 +382,216 @@ impl<T: BenchmarkType> MeasurementsCollection<T> {
             .unwrap_or_default()
     }
 
-    /// Save the collection of measurements as a json file.
+    /// Render the experiment parameters and aggregated results as plain text.
+    pub fn summary_text(&self) -> String {
+        let testbed = &self.testbed_parameters;
+        let execution = &self.execution_parameters;
+        let mut output = String::new();
+
+        writeln!(output, "Mysticeti Experiment Summary").unwrap();
+        writeln!(output, "============================").unwrap();
+        writeln!(output).unwrap();
+        writeln!(output, "Run").unwrap();
+        writeln!(
+            output,
+            "  started_at_unix_ms: {}",
+            self.run_started_at_unix_ms
+        )
+        .unwrap();
+        writeln!(output, "  commit: {}", self.commit).unwrap();
+        writeln!(output).unwrap();
+
+        writeln!(output, "Benchmark parameters").unwrap();
+        writeln!(
+            output,
+            "  benchmark_type: {}",
+            self.parameters.benchmark_type
+        )
+        .unwrap();
+        writeln!(output, "  nodes: {}", self.parameters.nodes).unwrap();
+        writeln!(output, "  faults: {}", self.parameters.faults).unwrap();
+        writeln!(output, "  input_load_tx_per_s: {}", self.parameters.load).unwrap();
+        let per_node_load = self
+            .parameters
+            .load
+            .checked_div(self.parameters.nodes)
+            .unwrap_or_default();
+        writeln!(output, "  input_load_per_node_tx_per_s: {per_node_load}").unwrap();
+        writeln!(
+            output,
+            "  configured_duration_s: {}",
+            self.parameters.duration.as_secs()
+        )
+        .unwrap();
+        writeln!(output).unwrap();
+
+        writeln!(output, "Testbed parameters").unwrap();
+        writeln!(output, "  testbed_id: {}", testbed.testbed_id).unwrap();
+        writeln!(output, "  cloud_provider: {}", testbed.cloud_provider).unwrap();
+        writeln!(output, "  machine_specs: {}", testbed.machine_specs).unwrap();
+        writeln!(output, "  regions: {}", testbed.regions.join(", ")).unwrap();
+        writeln!(output, "  repository_url: {}", testbed.repository_url).unwrap();
+        writeln!(output, "  repository_commit: {}", testbed.repository_commit).unwrap();
+        writeln!(
+            output,
+            "  benchmark_base_port: {}",
+            testbed.benchmark_base_port
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  working_directory: {}",
+            testbed.working_directory.display()
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  results_directory: {}",
+            testbed.results_directory.display()
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  logs_directory: {}",
+            testbed.logs_directory.display()
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  ssh_private_key_file: {}",
+            testbed.ssh_private_key_file.display()
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  ssh_private_key_passphrase_configured: {}",
+            testbed.ssh_private_key_passphrase_configured
+        )
+        .unwrap();
+        if let Some(public_key) = &testbed.ssh_public_key_file {
+            writeln!(output, "  ssh_public_key_file: {}", public_key.display()).unwrap();
+        }
+        writeln!(output, "  hosts:").unwrap();
+        for (index, host) in testbed.cloudlab_hosts.iter().enumerate() {
+            writeln!(
+                output,
+                "    {index}: ssh={}@{}:{}, protocol_ip={}, region={}",
+                host.username,
+                host.hostname,
+                host.port,
+                host.protocol_ip.as_deref().unwrap_or(&host.hostname),
+                host.region
+            )
+            .unwrap();
+        }
+        writeln!(output).unwrap();
+
+        writeln!(output, "Execution parameters").unwrap();
+        writeln!(
+            output,
+            "  command_line: {}",
+            execution.command_line.join(" ")
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  scrape_interval_s: {}",
+            execution.scrape_interval.as_secs_f64()
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  crash_interval_s: {}",
+            execution.crash_interval.as_secs_f64()
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  skip_testbed_update: {}",
+            execution.skip_testbed_update
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  skip_testbed_configuration: {}",
+            execution.skip_testbed_configuration
+        )
+        .unwrap();
+        writeln!(output, "  log_processing: {}", execution.log_processing).unwrap();
+        writeln!(
+            output,
+            "  dedicated_clients: {}",
+            execution.dedicated_clients
+        )
+        .unwrap();
+        writeln!(output, "  monitoring: {}", execution.monitoring).unwrap();
+        writeln!(
+            output,
+            "  ssh_timeout_s: {}",
+            execution
+                .ssh_timeout
+                .map(|duration| duration.as_secs_f64().to_string())
+                .unwrap_or_else(|| "none".into())
+        )
+        .unwrap();
+        writeln!(output, "  ssh_retries: {}", execution.ssh_retries).unwrap();
+        writeln!(
+            output,
+            "  protocol_environment: {}",
+            if execution.protocol_environment.is_empty() {
+                "(not set)"
+            } else {
+                &execution.protocol_environment
+            }
+        )
+        .unwrap();
+        writeln!(output).unwrap();
+
+        writeln!(output, "Results").unwrap();
+        writeln!(
+            output,
+            "  observed_duration_s: {}",
+            self.benchmark_duration().as_secs()
+        )
+        .unwrap();
+        let mut labels: Vec<_> = self.labels().collect();
+        labels.sort();
+        for label in labels {
+            let average_latency = self.aggregate_average_latency(label);
+            let stdev_latency = self.aggregate_stdev_latency(label);
+            writeln!(output, "  {label}:").unwrap();
+            writeln!(
+                output,
+                "    throughput_tx_per_s: {}",
+                self.aggregate_tps(label)
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "    average_latency_ms: {:.3}",
+                average_latency.as_secs_f64() * 1_000.0
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "    latency_stdev_ms: {:.3}",
+                stdev_latency.as_secs_f64() * 1_000.0
+            )
+            .unwrap();
+        }
+
+        output
+    }
+
+    /// Save only the human-readable experiment summary as a text file.
     pub fn save<P: AsRef<Path>>(&self, path: P) {
-        let json = serde_json::to_string_pretty(self).expect("Cannot serialize metrics");
         let mut file = PathBuf::from(path.as_ref());
-        file.push(format!("measurements-{:?}.json", self.parameters));
-        fs::write(file, json).unwrap();
+        fs::create_dir_all(&file).expect("Cannot create results directory");
+        file.push(format!(
+            "summary-{}-{:?}.txt",
+            self.run_started_at_unix_ms, self.parameters
+        ));
+        fs::write(file, self.summary_text()).unwrap();
     }
 
     /// Display a summary of the measurements.
@@ -316,14 +631,15 @@ impl<T: BenchmarkType> MeasurementsCollection<T> {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, time::Duration};
+    use std::{collections::HashMap, fs, time::Duration};
 
     use crate::{
         benchmark::test::TestBenchmarkType, protocol::test_protocol_metrics::TestProtocolMetrics,
         settings::Settings,
     };
+    use reqwest::Url;
 
-    use super::{BenchmarkParameters, Measurement, MeasurementsCollection};
+    use super::{BenchmarkParameters, ExecutionParameters, Measurement, MeasurementsCollection};
 
     #[test]
     fn average_latency() {
@@ -465,5 +781,55 @@ mod test {
                 assert_eq!(data.squared_sum.as_secs(), 952);
             }
         }
+    }
+
+    #[test]
+    fn saved_text_summary_includes_parameters_results_and_no_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::new_for_test();
+        settings.repository.url =
+            Url::parse("https://repository-token@example.com/owner/mysticeti?token=secret")
+                .unwrap();
+        settings.ssh_private_key_passphrase = Some("private-key-secret".into());
+
+        let mut collection = MeasurementsCollection::<TestBenchmarkType>::new(
+            &settings,
+            BenchmarkParameters::default(),
+        )
+        .with_execution_parameters(ExecutionParameters {
+            command_line: vec!["orchestrator".into(), "benchmark".into()],
+            scrape_interval: Duration::from_secs(5),
+            ssh_retries: 3,
+            ..ExecutionParameters::default()
+        });
+        let (label, measurement) = Measurement::new_for_test();
+        collection.add(0, label, measurement);
+        collection.save(directory.path());
+
+        let result_file = fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            result_file.extension().and_then(|x| x.to_str()),
+            Some("txt")
+        );
+        assert!(result_file
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&collection.run_started_at_unix_ms.to_string()));
+        let result = fs::read_to_string(&result_file).unwrap();
+        assert!(!result.contains("repository-token"));
+        assert!(!result.contains("private-key-secret"));
+        assert!(result.contains("repository_url: https://example.com/owner/mysticeti"));
+        assert!(result.contains("ssh_retries: 3"));
+        assert!(result.contains("nodes: 4"));
+        assert!(result.contains("input_load_tx_per_s: 500"));
+        assert!(result.contains("owned:"));
+        assert!(result.contains("throughput_tx_per_s: 62"));
+        assert!(!result.contains("\"data\""));
     }
 }

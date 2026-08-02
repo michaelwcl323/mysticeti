@@ -101,6 +101,8 @@ pub struct SshConnectionManager {
     username: String,
     /// The ssh primate key to connect to the instances.
     private_key_file: PathBuf,
+    /// Optional passphrase for an encrypted private key.
+    private_key_passphrase: Option<String>,
     /// The timeout value of the connection.
     timeout: Option<Duration>,
     /// The number of retries before giving up to execute the command.
@@ -116,9 +118,16 @@ impl SshConnectionManager {
         Self {
             username,
             private_key_file,
+            private_key_passphrase: None,
             timeout: None,
             retries: 0,
         }
+    }
+
+    /// Set the passphrase used to decrypt the SSH private key.
+    pub fn with_private_key_passphrase(mut self, passphrase: Option<String>) -> Self {
+        self.private_key_passphrase = passphrase;
+        self
     }
 
     /// Set a timeout duration for the connections.
@@ -133,11 +142,28 @@ impl SshConnectionManager {
         self
     }
 
+    /// Return the configured timeout so it can be recorded with experiment results.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// Return the configured retry count so it can be recorded with experiment results.
+    pub fn retries(&self) -> usize {
+        self.retries
+    }
+
     /// Create a new ssh connection with the provided host.
     pub async fn connect(&self, address: SocketAddr) -> SshResult<SshConnection> {
         let mut error = None;
         for _ in 0..self.retries + 1 {
-            match SshConnection::new(address, &self.username, self.private_key_file.clone()).await {
+            match SshConnection::new(
+                address,
+                &self.username,
+                self.private_key_file.clone(),
+                self.private_key_passphrase.clone(),
+            )
+            .await
+            {
                 Ok(x) => return Ok(x.with_timeout(&self.timeout).with_retries(self.retries)),
                 Err(e) => error = Some(e),
             }
@@ -289,6 +315,7 @@ impl SshConnection {
         address: SocketAddr,
         username: &str,
         private_key_file: P,
+        private_key_passphrase: Option<String>,
     ) -> SshResult<Self> {
         let tcp = TcpStream::connect(address)
             .await
@@ -302,7 +329,12 @@ impl SshConnection {
             .handshake()
             .map_err(|error| SshError::SessionError { address, error })?;
         session
-            .userauth_pubkey_file(username, None, private_key_file.as_ref(), None)
+            .userauth_pubkey_file(
+                username,
+                None,
+                private_key_file.as_ref(),
+                private_key_passphrase.as_deref(),
+            )
             .map_err(|error| SshError::SessionError { address, error })?;
 
         Ok(Self {

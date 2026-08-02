@@ -73,20 +73,32 @@ impl TransactionGenerator {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let mut block = Vec::with_capacity(transactions_per_100ms);
-                    let timestamp = (timestamp_utc().as_millis() as u64).to_le_bytes();
+                    let mut transactions = Vec::with_capacity(transactions_per_100ms);
 
                     for _ in 0..transactions_per_100ms {
                         random += counter;
 
                         let mut transaction = Vec::with_capacity(self.transaction_size);
-                        transaction.extend_from_slice(&timestamp); // 8 bytes
+                        // The submission timestamp is stamped after the whole batch has been
+                        // constructed, immediately before it is sent to the block handler.
+                        transaction.extend_from_slice(&[0u8; 8]); // 8 bytes timestamp
                         transaction.extend_from_slice(&random.to_le_bytes()); // 8 bytes
                         transaction.extend_from_slice(&zeros[..]);
 
-                        block.push(Transaction::new(transaction));
+                        transactions.push(transaction);
                         counter += 1;
                     }
+
+                    // This is the benchmark equivalent of the client starting its send call:
+                    // transaction construction is excluded, while send backpressure is included.
+                    let timestamp = (timestamp_utc().as_millis() as u64).to_le_bytes();
+                    let block = transactions
+                        .into_iter()
+                        .map(|mut transaction| {
+                            transaction[..8].copy_from_slice(&timestamp);
+                            Transaction::new(transaction)
+                        })
+                        .collect();
 
                     if self.sender.send(block).await.is_err() {
                         break;

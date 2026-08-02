@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 use super::error::CloudProviderResult;
 
 pub mod aws;
+pub mod cloudlab;
 pub mod vultr;
+
+fn default_ssh_port() -> u16 {
+    22
+}
 
 /// Represents a cloud provider instance.
 #[derive(Debug, Deserialize, Clone, Eq, PartialEq, Hash)]
@@ -22,6 +27,12 @@ pub struct Instance {
     pub region: String,
     /// The public ip address of the instance (accessible from anywhere).
     pub main_ip: Ipv4Addr,
+    /// Optional SSH address when it differs from the protocol address.
+    #[serde(default)]
+    pub ssh_ip: Option<Ipv4Addr>,
+    /// SSH port for this host.
+    #[serde(default = "default_ssh_port")]
+    pub ssh_port: u16,
     /// The list of tags associated with the instance.
     pub tags: Vec<String>,
     /// The specs of the instance.
@@ -48,7 +59,7 @@ impl Instance {
 
     /// Return the ssh address to connect to the instance.
     pub fn ssh_address(&self) -> SocketAddr {
-        format!("{}:22", self.main_ip).parse().unwrap()
+        SocketAddr::new(self.ssh_ip.unwrap_or(self.main_ip).into(), self.ssh_port)
     }
 
     #[cfg(test)]
@@ -57,6 +68,8 @@ impl Instance {
             id,
             region: Default::default(),
             main_ip: Ipv4Addr::new(127, 0, 0, 1),
+            ssh_ip: None,
+            ssh_port: default_ssh_port(),
             tags: Default::default(),
             specs: Default::default(),
             status: Default::default(),
@@ -67,7 +80,19 @@ impl Instance {
 #[async_trait::async_trait]
 pub trait ServerProviderClient: Display {
     /// The username used to connect to the instances.
-    const USERNAME: &'static str;
+    fn username(&self) -> &str;
+
+    /// Whether the provider owns the lifecycle of its machines. CloudLab
+    /// inventories are pre-allocated and therefore cannot be created, stopped,
+    /// or destroyed through this orchestrator.
+    fn manages_instance_lifecycle(&self) -> bool {
+        true
+    }
+
+    /// Whether a public key must be registered through the provider API.
+    fn requires_ssh_key_registration(&self) -> bool {
+        true
+    }
 
     /// List all existing instances (regardless of their status).
     async fn list_instances(&self) -> CloudProviderResult<Vec<Instance>>;
@@ -130,7 +155,9 @@ pub mod test_client {
 
     #[async_trait::async_trait]
     impl ServerProviderClient for TestClient {
-        const USERNAME: &'static str = "root";
+        fn username(&self) -> &str {
+            "root"
+        }
 
         async fn list_instances(&self) -> CloudProviderResult<Vec<Instance>> {
             let guard = self.instances.lock().unwrap();
@@ -171,6 +198,8 @@ pub mod test_client {
                 id: id.to_string(),
                 region: region.into(),
                 main_ip: format!("0.0.0.{id}").parse().unwrap(),
+                ssh_ip: None,
+                ssh_port: 22,
                 tags: Vec::new(),
                 specs: self.settings.specs.clone(),
                 status: "running".into(),

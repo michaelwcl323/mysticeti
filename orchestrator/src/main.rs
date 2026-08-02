@@ -1,11 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{str::FromStr, time::Duration};
+use std::{
+    fs,
+    str::FromStr,
+    time::{Duration, UNIX_EPOCH},
+};
 
 use benchmark::{BenchmarkParametersGenerator, LoadType};
 use clap::Parser;
-use client::{aws::AwsClient, vultr::VultrClient, ServerProviderClient};
+use client::{aws::AwsClient, cloudlab::CloudLabClient, vultr::VultrClient, ServerProviderClient};
 use eyre::{Context, Result};
 use faults::FaultsType;
 use measurement::MeasurementsCollection;
@@ -107,7 +111,7 @@ pub enum Operation {
         dedicated_clients: usize,
 
         /// Whether boot prometheus and grafana on a dedicated machine to monitor the benchmark.
-        #[clap(long, action, default_value = "true", global = true)]
+        #[clap(long, action = clap::ArgAction::Set, default_value_t = true, global = true)]
         monitoring: bool,
 
         /// The timeout duration for ssh commands (in seconds).
@@ -220,6 +224,10 @@ async fn main() -> Result<()> {
             // Execute the command.
             run(settings, client, opts).await
         }
+        CloudProvider::CloudLab => {
+            let client = CloudLabClient::new(settings.clone())?;
+            run(settings, client, opts).await
+        }
     }
 }
 
@@ -278,6 +286,7 @@ async fn run<C: ServerProviderClient>(settings: Settings, client: C, opts: Opts)
             let username = testbed.username();
             let private_key_file = settings.ssh_private_key_file.clone();
             let ssh_manager = SshConnectionManager::new(username.into(), private_key_file)
+                .with_private_key_passphrase(settings.ssh_private_key_passphrase())
                 .with_timeout(timeout)
                 .with_retries(retries);
 
@@ -340,7 +349,18 @@ async fn run<C: ServerProviderClient>(settings: Settings, client: C, opts: Opts)
 
         // Print a summary of the specified measurements collection.
         Operation::Summarize { path } => {
-            MeasurementsCollection::<BenchmarkType>::load(path)?.display_summary()
+            let mut measurements = MeasurementsCollection::<BenchmarkType>::load(&path)?;
+            measurements.record_testbed_parameters(&settings);
+            if measurements.run_started_at_unix_ms == 0 {
+                measurements.run_started_at_unix_ms = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or_default();
+            }
+            measurements.save(&settings.results_dir);
+            measurements.display_summary();
         }
     }
     Ok(())

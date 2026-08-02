@@ -147,6 +147,18 @@ impl Parameters {
         self
     }
 
+    /// Set the first network port explicitly. Network ports occupy the first
+    /// contiguous range and metrics ports the equally-sized range after it.
+    pub fn with_base_port(mut self, base_port: u16) -> Self {
+        let committee_size = self.identifiers.len() as u16;
+        for (index, id) in self.identifiers.iter_mut().enumerate() {
+            let network_port = base_port + index as u16;
+            id.network_address.set_port(network_port);
+            id.metrics_address.set_port(network_port + committee_size);
+        }
+        self
+    }
+
     pub fn with_number_of_leaders(mut self, number_of_leaders: usize) -> Self {
         self.number_of_leaders = number_of_leaders;
         self
@@ -247,5 +259,28 @@ impl StorageDir {
 
     pub fn wal(&self) -> PathBuf {
         self.path.join("wal")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::Parameters;
+
+    #[test]
+    fn benchmark_base_port_updates_network_and_metrics_ranges() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST); 4];
+        let parameters = Parameters::new_for_benchmarks(ips).with_base_port(5000);
+        let network_ports = parameters
+            .all_network_addresses()
+            .map(|address| address.port())
+            .collect::<Vec<_>>();
+        let metrics_ports = parameters
+            .all_metric_addresses()
+            .map(|address| address.port())
+            .collect::<Vec<_>>();
+        assert_eq!(network_ports, vec![5000, 5001, 5002, 5003]);
+        assert_eq!(metrics_ports, vec![5004, 5005, 5006, 5007]);
     }
 }

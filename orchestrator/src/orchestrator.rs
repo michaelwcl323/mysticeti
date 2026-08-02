@@ -3,7 +3,8 @@
 
 use futures::future::select_all;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    env,
     fs::{self},
     marker::PhantomData,
     path::PathBuf,
@@ -22,7 +23,7 @@ use crate::{
     error::{TestbedError, TestbedResult},
     faults::CrashRecoverySchedule,
     logs::LogsAnalyzer,
-    measurement::{Measurement, MeasurementsCollection},
+    measurement::{ExecutionParameters, Measurement, MeasurementsCollection},
     protocol::{ProtocolCommands, ProtocolMetrics},
     settings::Settings,
     ssh::{CommandContext, CommandStatus, SshConnectionManager},
@@ -283,27 +284,27 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
 
         let working_dir = self.settings.working_dir.display();
         let url = &self.settings.repository.url;
+        let repo_name = self.settings.repository_name();
         let install_node_exporter =
             include_str!("../assets/install_node_exporter.sh").replace('\n', "\\n");
         let basic_commands = [
-            "sudo rm -r project-mysticeti",
             "sudo apt-get update",
-            "sudo apt-get -y upgrade",
-            "sudo apt-get -y autoremove",
             // Disable "pending kernel upgrade" message.
-            "sudo apt-get -y remove needrestart",
+            "sudo apt-get -y remove needrestart || true",
             // The following dependencies
             // * build-essential: prevent the error: [error: linker `cc` not found].
             // * sysstat - for getting disk stats
             // * iftop - for getting network stats
             // * libssl-dev - Required to compile the orchestrator, todo remove this dependency
-            "sudo apt-get -y install build-essential sysstat iftop libssl-dev",
+            "sudo apt-get -y install build-essential clang cmake curl git iftop libfontconfig1-dev libfreetype6-dev libssl-dev pkg-config sysstat tmux",
             // * linux-tools-common linux-tools-generic linux-tools-* - installs perf
             // Perf is optional because sometimes aws release new kernel without publishing linux-tools package.
             // We don't want to just fail entire deployment when this happens.
             "sudo apt-get -y install linux-tools-common linux-tools-generic linux-tools-`uname -r` || echo 'Failed to install perf(optional)'",
-            // Install rust (non-interactive).
-            "curl --proto \"=https\" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+            // Install rust (non-interactive) only when the host does not
+            // already have rustup under its usual per-user location.
+            "(source $HOME/.cargo/env 2>/dev/null || true)",
+            "if ! command -v rustup >/dev/null 2>&1; then curl --proto \"=https\" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi",
             "echo \"source $HOME/.cargo/env\" | tee -a ~/.bashrc",
             "source $HOME/.cargo/env",
             "rustup default stable",
@@ -318,8 +319,10 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
 
             // Create the working directory.
             &format!("mkdir -p {working_dir}"),
-            // Clone the repo.
-            &format!("(git clone {url} || true)"),
+            // Clone the repo once, then preserve the checkout between runs.
+            &format!(
+                "if [ -d {repo_name}/.git ]; then git -C {repo_name} remote set-url origin {url}; else rm -rf {repo_name} && git clone {url} {repo_name}; fi"
+            ),
         ];
 
         let cloud_provider_specific_dependencies: Vec<_> = self
@@ -330,9 +333,14 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
 
         let protocol_dependencies = self.protocol_commands.protocol_dependencies();
 
+        let monitor_dependencies = if self.monitoring {
+            Monitor::dependencies()
+        } else {
+            Vec::new()
+        };
         let command = [
             &basic_commands[..],
-            &Monitor::dependencies()[..],
+            &monitor_dependencies[..],
             &cloud_provider_specific_dependencies[..],
             &protocol_dependencies[..],
         ]
@@ -405,9 +413,9 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
         let commit = &self.settings.repository.commit;
         let command = [
             &format!("git fetch origin {commit}"),
-            &format!("(git checkout -b {commit} {commit} || git checkout origin/{commit})"),
+            "git checkout --detach FETCH_HEAD",
             "source $HOME/.cargo/env",
-            "cargo build --release",
+            "cargo build --release --bin mysticeti",
         ]
         .join(" && ");
 
@@ -442,7 +450,11 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
         let command = self.protocol_commands.genesis_command(nodes.iter());
         let repo_name = self.settings.repository_name();
         let context = CommandContext::new().with_execute_from_path(repo_name.into());
-        let all = clients.into_iter().chain(nodes);
+        let mut seen = HashSet::new();
+        let all = clients
+            .into_iter()
+            .chain(nodes)
+            .filter(move |instance| seen.insert(instance.id.clone()));
         self.ssh_manager.execute(all, command, context).await?;
 
         display::done();
@@ -535,7 +547,20 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
         // Regularly scrape the client metrics.
         let metrics_commands = self.protocol_commands.clients_metrics_command(clients);
 
-        let mut aggregator = MeasurementsCollection::new(&self.settings, parameters.clone());
+        let mut aggregator = MeasurementsCollection::new(&self.settings, parameters.clone())
+            .with_execution_parameters(ExecutionParameters {
+                command_line: env::args().collect(),
+                scrape_interval: self.scrape_interval,
+                crash_interval: self.crash_interval,
+                skip_testbed_update: self.skip_testbed_update,
+                skip_testbed_configuration: self.skip_testbed_configuration,
+                log_processing: self.log_processing,
+                dedicated_clients: self.dedicated_clients,
+                monitoring: self.monitoring,
+                ssh_timeout: self.ssh_manager.timeout(),
+                ssh_retries: self.ssh_manager.retries(),
+                protocol_environment: env::var("ENV").unwrap_or_default(),
+            });
         let mut metrics_interval = time::interval(self.scrape_interval);
         metrics_interval.tick().await; // The first tick returns immediately.
 
@@ -562,13 +587,9 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
                         }
                     }
 
-                    let results_directory = &self.settings.results_dir;
-                    let commit = &self.settings.repository.commit;
-                    let path: PathBuf = [results_directory, &format!("results-{commit}").into()]
-                        .iter()
-                        .collect();
-                    fs::create_dir_all(&path).expect("Failed to create log directory");
-                    aggregator.save(path);
+                    // Save the timestamped text summary directly in results_dir. Keeping the
+                    // directory flat makes each CloudLab run easy to locate and compare.
+                    aggregator.save(&self.settings.results_dir);
 
                     if elapsed > parameters.duration .as_secs() {
                         break;
