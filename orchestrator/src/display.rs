@@ -82,6 +82,18 @@ pub fn done() {
     }
 }
 
+pub fn failed() {
+    if cfg!(not(test)) {
+        crossterm::execute!(
+            stdout(),
+            RestorePosition,
+            Clear(ClearType::UntilNewLine),
+            Print(format!("[{}]\n", "Failed".red()))
+        )
+        .unwrap();
+    }
+}
+
 pub fn newline() {
     if cfg!(not(test)) {
         crossterm::execute!(stdout(), Print("\n")).unwrap();

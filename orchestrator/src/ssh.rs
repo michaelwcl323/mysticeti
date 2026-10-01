@@ -112,6 +112,8 @@ pub struct SshConnectionManager {
 impl SshConnectionManager {
     /// Delay before re-attempting an ssh execution.
     const RETRY_DELAY: Duration = Duration::from_secs(5);
+    /// Stop waiting for metrics when the remote process has exited or this elapses.
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 
     /// Create a new ssh manager from the instances username and private keys.
     pub fn new(username: String, private_key_file: PathBuf) -> Self {
@@ -265,21 +267,110 @@ impl SshConnectionManager {
         Ok(())
     }
 
-    pub async fn wait_for_success<I, S>(&self, instances: I)
+    pub async fn wait_for_success<I, S>(
+        &self,
+        instances: I,
+        command_id: Option<&str>,
+    ) -> SshResult<()>
     where
         I: IntoIterator<Item = (Instance, S)> + Clone,
         S: Into<String> + Send + 'static + Clone,
     {
+        let targets: Vec<_> = instances.into_iter().collect();
+        let started = tokio::time::Instant::now();
         loop {
             sleep(Self::RETRY_DELAY).await;
 
             if self
-                .execute_per_instance(instances.clone(), CommandContext::default())
+                .execute_per_instance(targets.clone(), CommandContext::default())
                 .await
                 .is_ok()
             {
-                break;
+                return Ok(());
             }
+
+            let hosts: Vec<_> = targets
+                .iter()
+                .map(|(instance, _)| instance.clone())
+                .collect();
+            if let Some(command_id) = command_id {
+                let dead = self.terminated_sessions(&hosts, command_id).await?;
+                if !dead.is_empty() {
+                    return Err(self
+                        .startup_failure(
+                            command_id,
+                            &dead,
+                            "the remote process exited before metrics were reachable",
+                        )
+                        .await);
+                }
+            }
+
+            if started.elapsed() > Self::STARTUP_TIMEOUT {
+                let command_id = command_id.unwrap_or("metrics");
+                return Err(self
+                    .startup_failure(command_id, &hosts, "timed out waiting for metrics")
+                    .await);
+            }
+        }
+    }
+
+    async fn terminated_sessions(
+        &self,
+        instances: &[Instance],
+        command_id: &str,
+    ) -> SshResult<Vec<Instance>> {
+        let sessions = self
+            .execute(
+                instances.iter().cloned(),
+                "(tmux ls || true)",
+                CommandContext::default(),
+            )
+            .await?;
+        Ok(instances
+            .iter()
+            .zip(sessions)
+            .filter(|(_, (stdout, _))| {
+                CommandStatus::status(command_id, stdout) == CommandStatus::Terminated
+            })
+            .map(|(instance, _)| instance.clone())
+            .collect())
+    }
+
+    async fn startup_failure(
+        &self,
+        command_id: &str,
+        instances: &[Instance],
+        reason: &str,
+    ) -> SshError {
+        let log_path = format!("~/{command_id}.log");
+        let command = format!("(tail -n 20 {log_path} 2>/dev/null || true)");
+        let excerpts = match self
+            .execute(
+                instances.iter().cloned(),
+                command,
+                CommandContext::default(),
+            )
+            .await
+        {
+            Ok(outputs) => instances
+                .iter()
+                .zip(outputs)
+                .map(|(instance, (stdout, _))| {
+                    format!("{}:\n{}", instance.ssh_address(), stdout.trim())
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => format!("could not read {log_path}: {error}"),
+        };
+        SshError::CommandDidNotBecomeReady {
+            command: command_id.to_string(),
+            addresses: instances
+                .iter()
+                .map(|instance| instance.ssh_address().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            details: format!("{reason}\n{excerpts}"),
         }
     }
 

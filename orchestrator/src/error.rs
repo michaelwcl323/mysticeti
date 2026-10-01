@@ -73,6 +73,13 @@ pub enum SshError {
         code: i32,
         message: String,
     },
+
+    #[error("{command} did not become ready on {addresses}: {details}")]
+    CommandDidNotBecomeReady {
+        command: String,
+        addresses: String,
+        details: String,
+    },
 }
 
 pub type MonitorResult<T> = Result<T, MonitorError>;

@@ -228,17 +228,33 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
             .run_background("node".into())
             .with_log_file("~/node.log".into())
             .with_execute_from_path(repo.into());
-        self.ssh_manager
-            .execute_per_instance(targets, context)
-            .await?;
-
-        // Wait until all nodes are reachable.
         let commands = self
             .protocol_commands
             .nodes_metrics_command(instances.clone());
-        self.ssh_manager.wait_for_success(commands).await;
 
-        self.start_monitor(instances)
+        // One retry: a leftover listener makes the new process abort immediately.
+        // Free the ports and start again before giving up.
+        for attempt in 0..2 {
+            self.ssh_manager
+                .execute_per_instance(targets.clone(), context.clone())
+                .await?;
+            match self
+                .ssh_manager
+                .wait_for_success(commands.clone(), Some("node"))
+                .await
+            {
+                Ok(()) => return self.start_monitor(instances),
+                Err(_) if attempt == 0 => {
+                    display::status("retrying");
+                    self.cleanup_instances(false).await?;
+                }
+                Err(error) => {
+                    display::failed();
+                    return Err(error.into());
+                }
+            }
+        }
+        unreachable!("validator boot returns from the loop");
     }
 
     /// Monitors node process running on the instances,
@@ -269,8 +285,8 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
             let (instance, result) = match output {
                 Ok(output) => output,
                 Err(SshError::SessionError { .. } | SshError::ConnectionError { .. }) => continue, // Retry session error(likely timeout)
-                Err(SshError::NonZeroExitCode { code, .. }) => {
-                    panic!("Monitor command on {} failed with code: {}", i, code)
+                Err(error) => {
+                    panic!("Monitor command on {i} failed: {error}")
                 }
             };
             eprintln!("Node {} failed:\n{}", instance, result);
@@ -464,24 +480,30 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
     /// Cleanup all instances and optionally delete their log files.
     pub async fn cleanup(&self, cleanup: bool) -> TestbedResult<()> {
         display::action("Cleaning up testbed");
+        let result = self.cleanup_instances(cleanup).await;
+        if result.is_ok() {
+            display::done();
+        } else {
+            display::failed();
+        }
+        result
+    }
 
+    async fn cleanup_instances(&self, delete_logs: bool) -> TestbedResult<()> {
         // Kill all tmux servers and delete the nodes dbs. Optionally clear logs.
         let mut command = vec!["(tmux kill-server || true)".into()];
         command.extend(self.protocol_commands.cleanup_commands());
         for path in self.protocol_commands.db_directories() {
             command.push(format!("(rm -rf {} || true)", path.display()));
         }
-        if cleanup {
+        if delete_logs {
             command.push("(rm -rf ~/*log* || true)".into());
         }
-        let command = command.join(" ; ");
+        let command = command.join(" && ");
 
-        // Execute the deletion on all machines.
         let active = self.instances.iter().filter(|x| x.is_active()).cloned();
         let context = CommandContext::default();
         self.ssh_manager.execute(active, command, context).await?;
-
-        display::done();
         Ok(())
     }
 
@@ -525,7 +547,14 @@ impl<P: ProtocolCommands<T> + ProtocolMetrics, T: BenchmarkType> Orchestrator<P,
 
         // Wait until all load generators are reachable.
         let commands = self.protocol_commands.clients_metrics_command(clients);
-        self.ssh_manager.wait_for_success(commands).await;
+        if let Err(error) = self
+            .ssh_manager
+            .wait_for_success(commands, Some("node"))
+            .await
+        {
+            display::failed();
+            return Err(error.into());
+        }
 
         display::done();
         Ok(())

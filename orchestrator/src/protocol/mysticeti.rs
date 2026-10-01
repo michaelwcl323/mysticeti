@@ -76,7 +76,15 @@ impl ProtocolCommands<MysticetiBenchmarkType> for MysticetiProtocol {
     }
 
     fn cleanup_commands(&self) -> Vec<String> {
-        vec!["killall mysticeti".to_string()]
+        // A vanished process name is not enough: the metrics port can still be
+        // listening, and the next validator aborts on bind. Kill the validators
+        // and whoever owns the benchmark ports, and return only once those
+        // ports are no longer listening.
+        let base = self.benchmark_base_port;
+        let end = base.saturating_add(63);
+        vec![format!(
+            "(for _ in $(seq 1 40); do killall -9 mysticeti >/dev/null 2>&1 || true; killall -9 cargo >/dev/null 2>&1 || true; busy=$(ss -ltn | awk '$1 == \"LISTEN\" {{ n = split($4, a, \":\"); port = a[n] + 0; if (port >= {base} && port <= {end}) print port }}'); if [ -z \"$busy\" ]; then exit 0; fi; for port in $busy; do fuser -k -9 \"$port/tcp\" >/dev/null 2>&1 || true; done; sleep 0.25; done; echo \"benchmark ports still listening: $busy\" >&2; ss -ltn >&2; exit 1)"
+        )]
     }
 
     fn genesis_command<'a, I>(&self, instances: I) -> String
@@ -265,5 +273,18 @@ mod tests {
         assert!(command.contains("__MYSTICETI_PORT_0__"));
         assert!(command.contains(":5000"));
         assert!(command.contains(":5007"));
+    }
+
+    #[test]
+    fn cleanup_waits_until_benchmark_ports_are_free() {
+        let protocol = MysticetiProtocol::new(&Settings::new_for_test());
+        let command = protocol.cleanup_commands().join(" && ");
+        let base = protocol.benchmark_base_port;
+        let end = base.saturating_add(63);
+        assert!(command.contains("killall -9 mysticeti"));
+        assert!(command.contains("fuser -k -9"));
+        assert!(command.contains("ss -ltn"));
+        assert!(command.contains(&base.to_string()));
+        assert!(command.contains(&end.to_string()));
     }
 }
